@@ -13,9 +13,9 @@ env:
   AWS_REGION: us-east-1
   AWS_ROLE_ARN: arn:aws:iam::xxxxxxxxxxxxxxxxxxxxxxxxxxx
   STACK_NAME: xxxxxxxxxxxxxxxxxxxxxxxx
-  CFN_S3_BUCKET: tms-qa-app-s3
+  CFN_S3_BUCKET: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
   ECR_REGISTRY: xxxxxxxxxxxxxxxx.dkr.ecr.us-east-1.amazonaws.com
-  ECR_REPOSITORY: qa-reports-service
+  ECR_REPOSITORY: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 jobs:
   validate:
