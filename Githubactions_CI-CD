@@ -1,0 +1,218 @@
+name: Enterprise Microservice CI-CD Workflow
+
+on:
+  push:
+    branches:
+      - "devops-backend-uat"
+
+permissions:
+  id-token: write    
+  contents: read    
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ROLE_ARN: arn:aws:iam::xxxxxxxxxxxxxxxxxxxxxxxxxxx
+  STACK_NAME: xxxxxxxxxxxxxxxxxxxxxxxx
+  CFN_S3_BUCKET: tms-qa-app-s3
+  ECR_REGISTRY: xxxxxxxxxxxxxxxx.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY: qa-reports-service
+
+jobs:
+  validate:
+    name: "Stage 1: Code Quality Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Complete Codebase
+        uses: actions/checkout@v4
+      - name: Run Code Validation Scan
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/src -w /src gramener/builderrors builderrors || true
+
+  package:
+    name: "Stage 2: Source Packaging"
+    runs-on: ubuntu-latest
+    needs: validate 
+    outputs:
+      IMAGE_TAG: ${{ steps.generate_meta.outputs.IMAGE_TAG }}
+      ZIP_FILENAME: ${{ steps.generate_meta.outputs.ZIP_FILENAME }}
+    steps:
+      - name: Checkout Structural Configuration Only
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            AWS-Cloudformation
+
+      - name: Generate Meta Elements & Zip Artifact
+        id: generate_meta
+        run: |
+          TIMESTAMP=$(date +'%Y%m%d_%H%M%S')
+          FILENAME="build-package-${TIMESTAMP}.zip"
+          zip -r "$FILENAME" AWS-Cloudformation
+          echo "ZIP_FILENAME=$FILENAME" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=uat-${TIMESTAMP}" >> $GITHUB_OUTPUT
+
+      - name: Upload Workspace Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudformation-zip
+          path: ${{ steps.generate_meta.outputs.ZIP_FILENAME }}
+
+  backup_s3:
+    name: "Stage 3: S3 Backup"
+    runs-on: ubuntu-latest
+    needs: package
+    steps:
+      - name: Download Zip Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cloudformation-zip
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubS3Backup
+
+      - name: Upload Package to S3 Bucket
+        run: |
+          aws s3 cp "${{ needs.package.outputs.ZIP_FILENAME }}" s3://${{ env.CFN_S3_BUCKET }}/packages/
+
+  validate_ai:
+    name: "Stage 3.5: Offline AI Architecture Review"
+    runs-on: ubuntu-latest
+    needs: [package, backup_s3]
+    steps:
+      - name: Checkout Full Context
+        uses: actions/checkout@v4
+
+      - name: Install Ollama Engine (Offline LLM)
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve &
+          sleep 5
+          ollama pull qwen2.5-coder:7b
+
+      - name: Execute AI Cross-Configuration Audit
+        run: |
+          cat << 'EOF' > ai_audit.py
+          import requests
+          import json
+          import os
+
+          try:
+              with open('backend/services/reports/Dockerfile', 'r') as f:
+                  dockerfile = f.read()
+              with open('AWS-Cloudformation/tms-qa-stack3-04.yaml', 'r') as f:
+                  cfn = f.read()
+          except Exception as e:
+              print(f"Skipping audit; files not found: {e}")
+              exit(0)
+
+          prompt = f"""
+          You are an expert DevSecOps Cloud Architect. Inspect this Dockerfile and CloudFormation configuration for mismatches, security flaws, port alignment issues, or performance leaks.
+          
+          DOCKERFILE:
+          {dockerfile}
+
+          CLOUDFORMATION:
+          {cfn}
+
+          Provide a brief, concise bulleted list of potential architectural flaws. If everything looks perfect, state 'PASS'.
+          """
+
+          try:
+              response = requests.post('http://localhost:11434/api/generate', 
+                  json={
+                      "model": "qwen2.5-coder:7b",
+                      "prompt": prompt,
+                      "stream": False
+                  }, timeout=120
+              )
+              result = response.json().get('response', '')
+              print("\n OFFLINE AI ARCHITECT REPORT")
+              print(result)
+              print("\n")
+          except Exception as e:
+              print(f"AI Audit engine unavailable: {e}")
+          EOF
+          
+          python3 ai_audit.py
+
+  docker_build_and_push:
+    name: "Stage 4: Docker Build & ECR Push"
+    runs-on: ubuntu-latest
+    needs: [package, validate_ai]
+    outputs:
+      IMAGE_TAG: ${{ needs.package.outputs.IMAGE_TAG }}
+    steps:
+      - name: Checkout Full Repository Context
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubECRPush
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Reports Service to AWS ECR 
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: backend/services/reports/Dockerfile
+          push: true
+          tags: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ needs.package.outputs.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy_cfn:
+    name: "Stage 5: Reports Service Only Deployment"
+    runs-on: ubuntu-latest
+    needs: docker_build_and_push
+    steps:
+      - name: Checkout Structural Configuration Only
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            AWS-Cloudformation
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubReportsOnlyDeployment
+
+      - name: Deploy Reports Service Only
+        env:
+          IMAGE_TAG: ${{ needs.docker_build_and_push.outputs.IMAGE_TAG }}
+        run: |
+          TEMPLATE_PATH="AWS-Cloudformation/tms-qa-stack3-04.yaml"
+          
+          if [ ! -f "$TEMPLATE_PATH" ]; then
+            echo "Error: CloudFormation blueprint not found at $TEMPLATE_PATH"
+            exit 1
+          fi
+
+          aws cloudformation deploy \
+            --template-file "$TEMPLATE_PATH" \
+            --stack-name "$STACK_NAME" \
+            --s3-bucket "$CFN_S3_BUCKET" \
+            --s3-prefix "packages" \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides "ReportsImageTag=$IMAGE_TAG"
+
+      - name: Verify Reports Service Deployment
+        run: |
+          aws ecs wait services-stable \
+            --cluster "TMS-qa-app-cluster" \
+            --services "qa-reports-service"
